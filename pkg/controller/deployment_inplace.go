@@ -6,6 +6,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 
@@ -71,6 +72,10 @@ func (dc *controller) rolloutInPlace(ctx context.Context, d *v1alpha1.MachineDep
 		klog.Warningf("Failed to add %s on all nodes. Error: %s", PreferNoScheduleKey, err)
 	}
 
+	if err := dc.syncMachineSets(ctx, oldISs, newIS, d); err != nil {
+		return err
+	}
+
 	// In this section, we will attempt to scale up the new machine set. Machines with the `machine.sapcloud.io/update-successful` label
 	// can transfer their ownership to the new machine set.
 	// It is crucial to ensure that during the ownership transfer, the machine is not deleted,
@@ -111,6 +116,86 @@ func (dc *controller) rolloutInPlace(ctx context.Context, d *v1alpha1.MachineDep
 
 	// Sync deployment status
 	return dc.syncRolloutStatus(ctx, allISs, newIS, d)
+}
+
+func (dc *controller) syncMachineSets(ctx context.Context, olsISs []*v1alpha1.MachineSet, newIS *v1alpha1.MachineSet, deployment *v1alpha1.MachineDeployment) error {
+	machines, err := dc.machineLister.List(labels.SelectorFromSet(newIS.Spec.Selector.MatchLabels))
+	if err != nil {
+		return err
+	}
+
+	machinesWithUpdateSuccessfulLabel := filterMachinesWithUpdateSuccessfulLabel(machines)
+	klog.V(3).Infof("machine with update successful label in new machine set %v", len(machinesWithUpdateSuccessfulLabel))
+
+	if len(machines) > int(newIS.Spec.Replicas) && len(machinesWithUpdateSuccessfulLabel) > 0 {
+		// scale up the new machine set to the number of machines with the update successful label.
+		scaleUpBy := min(len(machinesWithUpdateSuccessfulLabel), len(machines)-int(newIS.Spec.Replicas))
+		_, _, err := dc.scaleMachineSetAndRecordEvent(ctx, newIS, newIS.Spec.Replicas+int32(scaleUpBy), deployment)
+		if err != nil {
+			return err
+		}
+	}
+
+	// remove all the label from the machines related to the inplace update.
+	for _, machine := range machinesWithUpdateSuccessfulLabel {
+		labelsToRemove := []string{
+			v1alpha1.LabelKeyMachineSelectedForUpdate,
+			v1alpha1.LabelKeyMachineDrainSuccessful,
+			v1alpha1.LabelKeyMachineUpdateSuccessful,
+		}
+
+		patchBytes, err := removeLabels(labelsToRemove)
+		if err != nil {
+			return err
+		}
+
+		klog.V(3).Infof("removing label from machine %s update-successful %v", machine.Name, labelsToRemove)
+		if err := dc.machineControl.PatchMachine(ctx, machine.Namespace, machine.Name, []byte(patchBytes)); err != nil {
+			fmt.Printf("error while removing label update-successful %s", err)
+			klog.V(3).Infof("error while removing label update-successful %s", err)
+			return err
+		}
+	}
+
+	// uncordon the node if the for the machine with the update successful label.
+	for _, machine := range machines {
+		nodeName, ok := machine.Labels[v1alpha1.NodeLabelKey]
+		if !ok {
+			return fmt.Errorf("node label not found for machine %s", machine.Name)
+		}
+
+		node, err := dc.nodeLister.Get(nodeName)
+		if err != nil {
+			return fmt.Errorf("failed to get node %s", nodeName)
+		}
+
+		nodeLabels := node.Labels
+		delete(nodeLabels, v1alpha1.LabelKeyMachineUpdateSuccessful)
+		delete(nodeLabels, v1alpha1.LabelKeyMachineIsReadyForUpdate)
+		node.ObjectMeta.Labels = nodeLabels
+		node.Spec.Unschedulable = false
+		_, err = dc.targetCoreClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to uncordon the node %s", node.Name)
+		}
+	}
+
+	for _, is := range olsISs {
+		// scale down the old machine set to the number of machines which is having the labelselector of the machine set.
+		machines, err := dc.machineLister.List(labels.SelectorFromSet(is.Spec.Selector.MatchLabels))
+		if err != nil {
+			return fmt.Errorf("failed to list machines for machine set %s", is.Name)
+		}
+
+		if len(machines) < int(is.Spec.Replicas) {
+			_, _, err := dc.scaleMachineSetAndRecordEvent(ctx, is, int32(len(machines)), deployment)
+			if err != nil {
+				return fmt.Errorf("failed to scale down machine set %s", is.Name)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (dc *controller) reconcileNewMachineSetInPlace(ctx context.Context, oldISs []*v1alpha1.MachineSet, newIS *v1alpha1.MachineSet, deployment *v1alpha1.MachineDeployment) (bool, error) {
@@ -354,4 +439,27 @@ func (dc *controller) getMachinesForDrain(is *v1alpha1.MachineSet, readyForDrain
 		return machinesWithoutSelectedForUpdate[:readyForDrain], nil
 	}
 	return machinesWithoutSelectedForUpdate, nil
+}
+
+func removeLabels(labelsToRemove []string) ([]byte, error) {
+	// Create a map to represent the patch
+	patchMap := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": map[string]interface{}{},
+		},
+	}
+
+	// Set each label to null to remove it
+	for _, label := range labelsToRemove {
+		patchMap["metadata"].(map[string]interface{})["labels"].(map[string]interface{})[label] = nil
+	}
+
+	// Convert patchMap to JSON
+	patchBytes, err := json.Marshal(patchMap)
+	if err != nil {
+		klog.Errorf("Error marshaling patch data: %v", err)
+		return nil, err
+	}
+
+	return patchBytes, nil
 }
